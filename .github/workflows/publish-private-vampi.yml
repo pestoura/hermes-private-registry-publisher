@@ -43,6 +43,11 @@ jobs:
           curl --fail --silent --show-error --location "$url" --output Dockerfile.upstream
           printf '%s  %s\n' "$DOCKERFILE_SHA256" Dockerfile.upstream | sha256sum --check --strict
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5
+        with:
+          driver: docker-container
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
         with:
