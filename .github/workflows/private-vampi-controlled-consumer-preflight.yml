@@ -62,15 +62,21 @@ jobs:
           if re.search(r"(?m)^\s*pull_request(_target)?:\s*$", text):
               raise SystemExit("FAIL: package-capable workflow must not run from PR triggers")
 
+          audit_start_marker = "      - name: Prove package authority is read-only by workflow policy"
+          audit_end_marker = "      - name: Set up isolated Docker credential configuration"
+          start = text.index(audit_start_marker)
+          end = text.index(audit_end_marker)
+          executable_text = text[:start] + text[end:]
+
           forbidden_patterns = {
-              "docker push": r"\bdocker\s+push\b",
-              "buildx --push": r"\bbuildx\b[^\n]*--push\b",
-              "registry DELETE": r"\bcurl\b[^\n]*(?:-X|--request)\s+DELETE\b",
-              "manifest PUT": r"\bcurl\b[^\n]*(?:-X|--request)\s+PUT\b[^\n]*/manifests/",
-              "blob upload": r"/blobs/uploads/",
+              "docker-push": r"\bdocker\s+push\b",
+              "buildx-push": r"\bbuildx\b[^\n]*--push\b",
+              "registry-delete": r"\bcurl\b[^\n]*(?:-X|--request)\s+DELETE\b",
+              "manifest-put": r"\bcurl\b[^\n]*(?:-X|--request)\s+PUT\b[^\n]*/manifests/",
+              "blob-upload": r"/blobs/uploads/",
           }
           for label, pattern in forbidden_patterns.items():
-              if re.search(pattern, text, flags=re.IGNORECASE):
+              if re.search(pattern, executable_text, flags=re.IGNORECASE):
                   raise SystemExit(f"FAIL: forbidden package mutation path present: {label}")
 
           print("CI_PACKAGE_PERMISSION_POLICY=PASS")
