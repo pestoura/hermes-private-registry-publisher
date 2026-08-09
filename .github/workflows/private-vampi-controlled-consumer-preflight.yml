@@ -28,6 +28,12 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Checkout publisher policy source
+        uses: actions/checkout@v4
+        with:
+          path: publisher
+          persist-credentials: false
+
       - name: Checkout exact canonical security-labs source
         uses: actions/checkout@v4
         with:
@@ -35,6 +41,51 @@ jobs:
           ref: ${{ env.SOURCE_SHA }}
           path: security-labs
           persist-credentials: false
+
+      - name: Prove package authority is read-only by workflow policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("publisher/.github/workflows/private-vampi-controlled-consumer-preflight.yml")
+          text = path.read_text()
+
+          if not re.search(r"(?m)^\s*packages:\s*read\s*$", text):
+              raise SystemExit("FAIL: workflow does not declare packages: read")
+          if re.search(r"(?m)^\s*packages:\s*write\s*$", text):
+              raise SystemExit("FAIL: workflow declares packages: write")
+          if re.search(r"(?m)^\s*permissions:\s*write-all\s*$", text):
+              raise SystemExit("FAIL: workflow declares permissions: write-all")
+          if re.search(r"(?m)^\s*pull_request(_target)?:\s*$", text):
+              raise SystemExit("FAIL: package-capable workflow must not run from PR triggers")
+
+          lines = text.splitlines()
+          operational_marker = "      - name: Set up isolated Docker credential configuration"
+          try:
+              operational_index = lines.index(operational_marker)
+          except ValueError as exc:
+              raise SystemExit("FAIL: operational workflow boundary marker missing") from exc
+          executable_text = "\n".join(lines[operational_index:])
+
+          forbidden_patterns = {
+              "docker-push": r"\bdocker\s+push\b",
+              "buildx-push": r"\bbuildx\b[^\n]*--push\b",
+              "registry-delete": r"\bcurl\b[^\n]*(?:-X|--request)\s+DELETE\b",
+              "manifest-put": r"\bcurl\b[^\n]*(?:-X|--request)\s+PUT\b[^\n]*/manifests/",
+              "blob-upload": r"/blobs/uploads/",
+          }
+          for label, pattern in forbidden_patterns.items():
+              if re.search(pattern, executable_text, flags=re.IGNORECASE):
+                  raise SystemExit(f"FAIL: forbidden package mutation path present: {label}")
+
+          print("CI_PACKAGE_PERMISSION_POLICY=PASS")
+          print("PACKAGES_PERMISSION=read")
+          print("PACKAGE_MUTATION_PATHS=absent")
+          PY
+          echo "WRITE_AUTHORITY_POLICY_CONTROL=PASS" >> "$GITHUB_ENV"
 
       - name: Set up isolated Docker credential configuration
         shell: bash
@@ -118,14 +169,17 @@ jobs:
             echo "- Canonical source SHA: \`$SOURCE_SHA\`"
             echo "- Private image: \`$IMAGE_REF\`"
             echo '- Credential: ephemeral repository `GITHUB_TOKEN`'
-            echo '- Workflow authority: `contents: read`, `packages: read`'
+            echo '- Effective workflow authority: `contents: read`, `packages: read`'
+            echo '- Package mutation paths in workflow: `absent`'
+            echo '- PR-triggered package-capable execution: `forbidden`'
             echo '- Exact private digest pull: `PASS`'
             echo '- Core VAmPI lifecycle: `PASS`'
             echo '- Residual containers/networks: `0`'
             echo '- Package mutation: `none`'
             echo '- Long-lived credential: `none`'
+            echo '- GHCR bearer grant introspection: `UNSUPPORTED_OPAQUE_TOKEN`'
             echo '- Evidence class: `CONTROLLED_CI_PREFLIGHT_ONLY`'
-            echo '- Hermes Gate F/H final status: `NOT_CLAIMED`'
+            echo '- Hermes Gate F/G/H final status: `NOT_CLAIMED`'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup credentials and runtime state
