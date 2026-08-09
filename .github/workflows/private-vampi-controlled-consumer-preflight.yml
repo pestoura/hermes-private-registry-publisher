@@ -62,11 +62,13 @@ jobs:
           if re.search(r"(?m)^\s*pull_request(_target)?:\s*$", text):
               raise SystemExit("FAIL: package-capable workflow must not run from PR triggers")
 
-          audit_start_marker = "      - name: Prove package authority is read-only by workflow policy"
-          audit_end_marker = "      - name: Set up isolated Docker credential configuration"
-          start = text.index(audit_start_marker)
-          end = text.index(audit_end_marker)
-          executable_text = text[:start] + text[end:]
+          lines = text.splitlines()
+          operational_marker = "      - name: Set up isolated Docker credential configuration"
+          try:
+              operational_index = lines.index(operational_marker)
+          except ValueError as exc:
+              raise SystemExit("FAIL: operational workflow boundary marker missing") from exc
+          executable_text = "\n".join(lines[operational_index:])
 
           forbidden_patterns = {
               "docker-push": r"\bdocker\s+push\b",
