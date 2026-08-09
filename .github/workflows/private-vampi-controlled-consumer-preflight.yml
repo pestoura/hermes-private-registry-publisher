@@ -65,6 +65,56 @@ jobs:
           printf '%s\n' "$repo_digests" | grep -Fq "${IMAGE_DIGEST}"
           echo "PRIVATE_DIGEST_PULL=PASS" >> "$GITHUB_ENV"
 
+      - name: Prove requested push authority is not granted
+        shell: bash
+        env:
+          GHCR_REPOSITORY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          actor = os.environ["GITHUB_ACTOR"]
+          repository_token = os.environ["GHCR_REPOSITORY_TOKEN"]
+          scope = "repository:pestoura/hermes-private-vampi:pull,push"
+          query = urllib.parse.urlencode({"service": "ghcr.io", "scope": scope})
+          request = urllib.request.Request(f"https://ghcr.io/token?{query}")
+          basic = base64.b64encode(f"{actor}:{repository_token}".encode()).decode()
+          request.add_header("Authorization", f"Basic {basic}")
+
+          with urllib.request.urlopen(request, timeout=15) as response:
+              payload = json.load(response)
+
+          bearer = payload.get("token") or payload.get("access_token")
+          if not bearer:
+              raise SystemExit("FAIL: GHCR token service did not return a bearer token")
+
+          parts = bearer.split(".")
+          if len(parts) != 3:
+              raise SystemExit("FAIL: GHCR bearer token format does not expose inspectable granted actions")
+
+          encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(encoded).decode())
+          actions = set()
+          for grant in claims.get("access", []):
+              if grant.get("type") == "repository" and grant.get("name") == "pestoura/hermes-private-vampi":
+                  actions.update(grant.get("actions", []))
+
+          if "pull" not in actions:
+              raise SystemExit("FAIL: requested authorization did not retain required pull authority")
+          if "push" in actions:
+              raise SystemExit("FAIL: read-only workflow token was granted push authority")
+
+          print("GHCR_WRITE_AUTHORITY_NEGATIVE_CONTROL=PASS")
+          print("GRANTED_ACTIONS=" + ",".join(sorted(actions)))
+          PY
+          unset GHCR_REPOSITORY_TOKEN
+          echo "WRITE_AUTHORITY_NEGATIVE_CONTROL=PASS" >> "$GITHUB_ENV"
+
       - name: Create runtime-only private digest override
         shell: bash
         run: |
@@ -120,12 +170,14 @@ jobs:
             echo '- Credential: ephemeral repository `GITHUB_TOKEN`'
             echo '- Workflow authority: `contents: read`, `packages: read`'
             echo '- Exact private digest pull: `PASS`'
+            echo '- Requested `pull,push` authorization: `push not granted`'
+            echo '- Registry upload/delete operation: `none`'
             echo '- Core VAmPI lifecycle: `PASS`'
             echo '- Residual containers/networks: `0`'
             echo '- Package mutation: `none`'
             echo '- Long-lived credential: `none`'
             echo '- Evidence class: `CONTROLLED_CI_PREFLIGHT_ONLY`'
-            echo '- Hermes Gate F/H final status: `NOT_CLAIMED`'
+            echo '- Hermes Gate F/G/H final status: `NOT_CLAIMED`'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup credentials and runtime state
