@@ -1,0 +1,89 @@
+name: Private VAmPI anonymous-deny gate
+
+on:
+  push:
+    branches:
+      - main
+      - 'lane/**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REF: ghcr.io/pestoura/hermes-private-vampi@sha256:b1b66324a2d35cfe55e3edcd81f9f3c012907c71367df37f83d9ef63b500b3d3
+
+jobs:
+  anonymous-deny:
+    name: Prove exact-digest anonymous denial
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Set up isolated anonymous Docker configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          anon_dir="${RUNNER_TEMP}/hermes-anonymous-docker"
+          mkdir -p "$anon_dir"
+          chmod 700 "$anon_dir"
+          printf '{"auths":{}}\n' > "${anon_dir}/config.json"
+          chmod 600 "${anon_dir}/config.json"
+          echo "DOCKER_CONFIG=${anon_dir}" >> "$GITHUB_ENV"
+
+      - name: Prove GHCR registry is reachable
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(curl --silent --show-error --output /tmp/ghcr-v2-body --write-out '%{http_code}' https://ghcr.io/v2/ || true)"
+          if [[ "$status" != "401" ]]; then
+            echo "Expected GHCR registry challenge HTTP 401, got ${status:-transport-error}" >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5
+        with:
+          driver: docker-container
+
+      - name: Prove exact private digest is denied anonymously
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/anonymous-inspect.out"
+          err="${RUNNER_TEMP}/anonymous-inspect.err"
+
+          set +e
+          docker buildx imagetools inspect "$IMAGE_REF" >"$out" 2>"$err"
+          rc=$?
+          set -e
+
+          if [[ "$rc" -eq 0 ]]; then
+            echo "FAIL: private VAmPI digest is anonymously readable" >&2
+            exit 1
+          fi
+
+          if ! grep -Eiq 'unauthorized|denied|authentication required|insufficient[_ -]?scope|permission' "$err"; then
+            echo "FAIL: anonymous inspection failed for a reason other than an authorization denial" >&2
+            sed -E 's/[[:cntrl:]]//g' "$err" | head -n 20 >&2
+            exit 1
+          fi
+
+          {
+            echo '### Private VAmPI anonymous-deny gate'
+            echo
+            echo "- Exact digest: \`$IMAGE_REF\`"
+            echo '- Docker credential config: isolated and empty'
+            echo '- GHCR reachability: `PASS`'
+            echo '- Anonymous exact-digest inspection: `DENIED`'
+            echo '- Credential used: `none`'
+            echo '- Package/runtime mutation: `none`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove anonymous Docker configuration
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "${RUNNER_TEMP}/hermes-anonymous-docker"
