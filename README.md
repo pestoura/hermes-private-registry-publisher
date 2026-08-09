@@ -5,7 +5,7 @@ Publication boundary for reviewed GitHub Actions workflows that create private G
 ## Security boundary
 
 - Public canonical source: `pestoura/hermes-security-labs`.
-- Target publisher and package-permission boundary: this repository, **private in the accepted operating state**.
+- Target publisher and package-permission boundary: this repository, **private in the accepted final operating state**.
 - Pilot package: `ghcr.io/pestoura/hermes-private-vampi`.
 - Publication uses this repository's ephemeral `GITHUB_TOKEN`.
 - Hermes runtime access must use a separate credential limited to `read:packages`.
@@ -26,21 +26,44 @@ The private VAmPI publication pilot has already executed successfully:
 
 An automated anonymous-deny gate is maintained in `.github/workflows/private-vampi-anonymous-deny.yml`. It uses an isolated empty Docker credential configuration and fails closed unless the exact accepted digest is denied specifically for authentication/authorization reasons.
 
-## Current visibility drift
+## Accepted boundary and temporary implementation exception
 
-As of 2026-08-09 this repository is temporarily `public` for audit access. **That is not the accepted target state.**
+The accepted **final operating state** keeps this publisher repository `private` and keeps the `hermes-private-vampi` package private.
 
-Before any Hermes `read:packages` credential is provisioned, authenticated private pull is attempted, or Compose migration begins, this repository must be restored to `private` and that state must be re-verified.
+On 2026-08-09 the owner explicitly authorized a temporary implementation exception: this publisher repository may be changed to `public` solely while repository implementation and GitHub Actions validation are being completed, because GitHub-hosted Actions are blocked for this account while the repository is private.
+
+This exception does **not** authorize any of the following:
+
+- changing `hermes-private-vampi` package visibility from `private`;
+- granting `pestoura/hermes-security-labs` or another repository package access;
+- storing a PAT, Docker auth material or reusable registry credential in GitHub;
+- using the public publisher repository as the Hermes runtime credential boundary;
+- treating the temporary public repository state as the accepted final operating state.
+
+Before issue `#53` can be closed, the publisher repository must be restored to `private` and the private-package boundaries must be revalidated.
+
+The owner has separately confirmed the GitHub Package Settings gate for `hermes-private-vampi`: the package remains private, the private publisher is the intended repository access boundary, the public canonical source repository has no package access, and no unapproved repository, team or user access is present.
+
+The linked GitHub integration still receives `403 Resource not accessible by integration` from the Packages API. Therefore package repository-access details are recorded as **owner-confirmed**, not API-verified. This limitation does not override or weaken the independent runtime access controls.
 
 The package itself must remain private throughout. Making the package public would permanently reject that package identity for the private target state.
 
-## Remaining gate
+## Remaining operational gate
 
-The linked GitHub integration cannot read the package repository-access list and receives `403 Resource not accessible by integration` from the Packages API. Therefore issue `pestoura/hermes-security-labs#53` remains blocked before credential provisioning until both conditions are recorded:
+With the temporary public-repository implementation exception active, the controlled sequence is:
 
-1. this publisher repository is restored to `private`;
-2. GitHub Package Settings confirm that no unapproved repository, user or team has access and that `pestoura/hermes-security-labs` has no package access.
+1. run and merge the repository-only validation/reconciliation work while the publisher is temporarily public;
+2. provision a distinct Hermes consumer credential with exactly `read:packages` outside GitHub and outside version control;
+3. authenticate through stdin using an isolated Docker configuration;
+4. prove exact-digest private pull;
+5. prove absence of push/delete authority without package mutation;
+6. run temporary private VAmPI lifecycle parity;
+7. review and merge the separate Compose migration;
+8. perform exact-SHA post-merge acceptance;
+9. demonstrate rollback to the accepted public digest;
+10. reconcile deployment tracking and drift detection;
+11. restore the publisher repository to `private` and revalidate final boundaries before closure.
 
-After those conditions pass, the controlled sequence is: authenticated exact-digest read-only pull → safe negative control for write/delete authority → temporary lifecycle parity → reviewed Compose migration → exact-SHA post-merge acceptance → rollback proof → deployment tracking reconciliation.
+No consumer PAT is stored in this repository or in GitHub Actions for the runtime acceptance path.
 
 The canonical transition specification remains `pestoura/hermes-security-labs/docs/ghcr-private-readonly-transition.md` and tracking issue `#53`.
