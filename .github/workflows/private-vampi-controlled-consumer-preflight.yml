@@ -28,6 +28,12 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Checkout publisher policy source
+        uses: actions/checkout@v4
+        with:
+          path: publisher
+          persist-credentials: false
+
       - name: Checkout exact canonical security-labs source
         uses: actions/checkout@v4
         with:
@@ -35,6 +41,43 @@ jobs:
           ref: ${{ env.SOURCE_SHA }}
           path: security-labs
           persist-credentials: false
+
+      - name: Prove package authority is read-only by workflow policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("publisher/.github/workflows/private-vampi-controlled-consumer-preflight.yml")
+          text = path.read_text()
+
+          if not re.search(r"(?m)^\s*packages:\s*read\s*$", text):
+              raise SystemExit("FAIL: workflow does not declare packages: read")
+          if re.search(r"(?m)^\s*packages:\s*write\s*$", text):
+              raise SystemExit("FAIL: workflow declares packages: write")
+          if re.search(r"(?m)^\s*permissions:\s*write-all\s*$", text):
+              raise SystemExit("FAIL: workflow declares permissions: write-all")
+          if re.search(r"(?m)^\s*pull_request(_target)?:\s*$", text):
+              raise SystemExit("FAIL: package-capable workflow must not run from PR triggers")
+
+          forbidden_patterns = {
+              "docker push": r"\bdocker\s+push\b",
+              "buildx --push": r"\bbuildx\b[^\n]*--push\b",
+              "registry DELETE": r"\bcurl\b[^\n]*(?:-X|--request)\s+DELETE\b",
+              "manifest PUT": r"\bcurl\b[^\n]*(?:-X|--request)\s+PUT\b[^\n]*/manifests/",
+              "blob upload": r"/blobs/uploads/",
+          }
+          for label, pattern in forbidden_patterns.items():
+              if re.search(pattern, text, flags=re.IGNORECASE):
+                  raise SystemExit(f"FAIL: forbidden package mutation path present: {label}")
+
+          print("CI_PACKAGE_PERMISSION_POLICY=PASS")
+          print("PACKAGES_PERMISSION=read")
+          print("PACKAGE_MUTATION_PATHS=absent")
+          PY
+          echo "WRITE_AUTHORITY_POLICY_CONTROL=PASS" >> "$GITHUB_ENV"
 
       - name: Set up isolated Docker credential configuration
         shell: bash
@@ -64,56 +107,6 @@ jobs:
           repo_digests="$(docker image inspect "$IMAGE_REF" --format '{{join .RepoDigests "\n"}}')"
           printf '%s\n' "$repo_digests" | grep -Fq "${IMAGE_DIGEST}"
           echo "PRIVATE_DIGEST_PULL=PASS" >> "$GITHUB_ENV"
-
-      - name: Prove requested push authority is not granted
-        shell: bash
-        env:
-          GHCR_REPOSITORY_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import base64
-          import json
-          import os
-          import urllib.parse
-          import urllib.request
-
-          actor = os.environ["GITHUB_ACTOR"]
-          repository_token = os.environ["GHCR_REPOSITORY_TOKEN"]
-          scope = "repository:pestoura/hermes-private-vampi:pull,push"
-          query = urllib.parse.urlencode({"service": "ghcr.io", "scope": scope})
-          request = urllib.request.Request(f"https://ghcr.io/token?{query}")
-          basic = base64.b64encode(f"{actor}:{repository_token}".encode()).decode()
-          request.add_header("Authorization", f"Basic {basic}")
-
-          with urllib.request.urlopen(request, timeout=15) as response:
-              payload = json.load(response)
-
-          bearer = payload.get("token") or payload.get("access_token")
-          if not bearer:
-              raise SystemExit("FAIL: GHCR token service did not return a bearer token")
-
-          parts = bearer.split(".")
-          if len(parts) != 3:
-              raise SystemExit("FAIL: GHCR bearer token format does not expose inspectable granted actions")
-
-          encoded = parts[1] + "=" * (-len(parts[1]) % 4)
-          claims = json.loads(base64.urlsafe_b64decode(encoded).decode())
-          actions = set()
-          for grant in claims.get("access", []):
-              if grant.get("type") == "repository" and grant.get("name") == "pestoura/hermes-private-vampi":
-                  actions.update(grant.get("actions", []))
-
-          if "pull" not in actions:
-              raise SystemExit("FAIL: requested authorization did not retain required pull authority")
-          if "push" in actions:
-              raise SystemExit("FAIL: read-only workflow token was granted push authority")
-
-          print("GHCR_WRITE_AUTHORITY_NEGATIVE_CONTROL=PASS")
-          print("GRANTED_ACTIONS=" + ",".join(sorted(actions)))
-          PY
-          unset GHCR_REPOSITORY_TOKEN
-          echo "WRITE_AUTHORITY_NEGATIVE_CONTROL=PASS" >> "$GITHUB_ENV"
 
       - name: Create runtime-only private digest override
         shell: bash
@@ -168,14 +161,15 @@ jobs:
             echo "- Canonical source SHA: \`$SOURCE_SHA\`"
             echo "- Private image: \`$IMAGE_REF\`"
             echo '- Credential: ephemeral repository `GITHUB_TOKEN`'
-            echo '- Workflow authority: `contents: read`, `packages: read`'
+            echo '- Effective workflow authority: `contents: read`, `packages: read`'
+            echo '- Package mutation paths in workflow: `absent`'
+            echo '- PR-triggered package-capable execution: `forbidden`'
             echo '- Exact private digest pull: `PASS`'
-            echo '- Requested `pull,push` authorization: `push not granted`'
-            echo '- Registry upload/delete operation: `none`'
             echo '- Core VAmPI lifecycle: `PASS`'
             echo '- Residual containers/networks: `0`'
             echo '- Package mutation: `none`'
             echo '- Long-lived credential: `none`'
+            echo '- GHCR bearer grant introspection: `UNSUPPORTED_OPAQUE_TOKEN`'
             echo '- Evidence class: `CONTROLLED_CI_PREFLIGHT_ONLY`'
             echo '- Hermes Gate F/G/H final status: `NOT_CLAIMED`'
           } >> "$GITHUB_STEP_SUMMARY"
