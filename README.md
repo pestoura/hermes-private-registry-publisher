@@ -1,69 +1,162 @@
 # Hermes Private Registry Publisher
 
-Publication boundary for reviewed GitHub Actions workflows that create private GHCR packages consumed by Hermes.
+[![Role](https://img.shields.io/badge/role-private%20GHCR%20publication%20boundary-0b7285)](docs/README.md)
+[![Pilot](https://img.shields.io/badge/VAmPI%20pilot-publication%20successful-2ea44f)](docs/vampi-private-pilot.md)
+[![Repository](https://img.shields.io/badge/repository-temporarily%20public-f59f00)](#current-state)
+[![Package](https://img.shields.io/badge/package-private%20required-b42318)](#security-boundary)
+
+> A deliberately narrow GitHub Actions publication boundary for building reviewed private GHCR packages consumed by Hermes. **It publishes artifacts; it does not deploy them.**
+
+## Current state
+
+**Reviewed 2026-08-09.**
+
+- the VAmPI private-publication pilot has successfully produced a private GHCR package;
+- publication workflow, SBOM/provenance and anonymous-deny controls exist;
+- the repository is **currently public under an explicitly temporary implementation exception**;
+- the accepted final operating state requires this repository to be **private** again;
+- the `hermes-private-vampi` package must remain **private throughout**;
+- Hermes runtime pull/deployment is a separate consumer-side acceptance boundary.
+
+```mermaid
+flowchart LR
+    SRC[Public canonical source<br/>hermes-security-labs] --> PUB[Private Registry Publisher<br/>GitHub Actions]
+    PUB --> GHCR[Private GHCR package]
+    GHCR -->|separate read-only credential| H[Hermes consumer/runtime]
+    PUB -. no automatic deployment .-> H
+```
+
+## Why this repository exists
+
+The canonical lab source can remain public while a separate trust boundary owns **private package publication**. This avoids granting the source repository or runtime broader registry permissions than they require.
 
 ## Security boundary
 
-- Public canonical source: `pestoura/hermes-security-labs`.
-- Target publisher and package-permission boundary: this repository, **private in the accepted final operating state**.
-- Pilot package: `ghcr.io/pestoura/hermes-private-vampi`.
-- Publication uses this repository's ephemeral `GITHUB_TOKEN`.
-- Hermes runtime access must use a separate credential limited to `read:packages`.
-- No self-hosted runner, Hermes Docker socket or automatic deployment is permitted.
-- No PAT, Docker auth material, private key or reusable registry credential may be committed here.
+| Concern | Boundary |
+|---|---|
+| Canonical source | `pestoura/hermes-security-labs` |
+| Publisher | this repository / GitHub-hosted Actions |
+| Publication credential | ephemeral repository `GITHUB_TOKEN` |
+| Artifact | private `ghcr.io/pestoura/hermes-private-vampi` |
+| Runtime consumer credential | separate credential, exactly scoped for package read where possible |
+| Deployment | outside this repository |
+| Docker socket on Hermes | not used by publisher workflows |
+| Reusable registry credential in Git | forbidden |
 
-## Current state — 2026-08-09
+```mermaid
+flowchart TB
+    subgraph GitHub[GitHub trust domain]
+      A[Reviewed workflow]
+      T[Ephemeral GITHUB_TOKEN]
+      A --> T
+    end
 
-The private VAmPI publication pilot has already executed successfully:
+    T --> P[Private GHCR package]
 
-- publisher workflow: `.github/workflows/publish-private-vampi.yml`;
-- owner-triggered publication run: `30680647184`;
-- publication result: `SUCCESS`;
-- publisher commit used for publication: `1ce1b1c72c20cf9267fbdc460f40fcfe1d310d08`;
-- private VAmPI OCI index: `sha256:b1b66324a2d35cfe55e3edcd81f9f3c012907c71367df37f83d9ef63b500b3d3`;
-- SBOM and BuildKit provenance: enabled by the accepted publication workflow;
-- Hermes deployment: not performed by the publisher workflow.
+    subgraph Runtime[Hermes runtime trust domain]
+      R[Dedicated read-only consumer credential]
+      H[Hermes / lab consumer]
+      R --> H
+    end
 
-An automated anonymous-deny gate is maintained in `.github/workflows/private-vampi-anonymous-deny.yml`. It uses an isolated empty Docker credential configuration and fails closed unless the exact accepted digest is denied specifically for authentication/authorization reasons.
+    P --> H
+    A -. cannot deploy .-> H
+```
 
-## Accepted boundary and temporary implementation exception
+## Verified pilot evidence
 
-The accepted **final operating state** keeps this publisher repository `private` and keeps the `hermes-private-vampi` package private.
+The private VAmPI publication pilot has executed successfully:
 
-On 2026-08-09 the owner explicitly authorized a temporary implementation exception: this publisher repository may be changed to `public` solely while repository implementation and GitHub Actions validation are being completed, because GitHub-hosted Actions are blocked for this account while the repository is private.
+| Evidence | Value |
+|---|---|
+| Publisher workflow | `.github/workflows/publish-private-vampi.yml` |
+| Owner-triggered publication run | `30680647184` |
+| Result | `SUCCESS` |
+| Publisher commit | `1ce1b1c72c20cf9267fbdc460f40fcfe1d310d08` |
+| Private VAmPI OCI index | `sha256:b1b66324a2d35cfe55e3edcd81f9f3c012907c71367df37f83d9ef63b500b3d3` |
+| SBOM / BuildKit provenance | enabled by accepted publication workflow |
+| Publisher-driven Hermes deployment | **not performed** |
 
-This exception does **not** authorize any of the following:
+An independent workflow also verifies that anonymous access to the exact private digest is denied for authentication/authorization reasons.
 
-- changing `hermes-private-vampi` package visibility from `private`;
-- granting `pestoura/hermes-security-labs` or another repository package access;
-- storing a PAT, Docker auth material or reusable registry credential in GitHub;
-- using the public publisher repository as the Hermes runtime credential boundary;
-- treating the temporary public repository state as the accepted final operating state.
+## Temporary repository-visibility exception
 
-Before issue `#53` can be closed, the publisher repository must be restored to `private` and the private-package boundaries must be revalidated.
+The final design requires a private publisher repository. The repository is currently public only because GitHub-hosted Actions were blocked for this account while it was private and an owner-approved implementation exception was granted.
 
-The owner has separately confirmed the GitHub Package Settings gate for `hermes-private-vampi`: the package remains private, the private publisher is the intended repository access boundary, the public canonical source repository has no package access, and no unapproved repository, team or user access is present.
+```mermaid
+stateDiagram-v2
+    [*] --> FinalPrivate: intended steady state
+    FinalPrivate --> TempPublic: explicit implementation exception
+    TempPublic --> FinalPrivate: restore + revalidate before closure
+```
 
-The linked GitHub integration still receives `403 Resource not accessible by integration` from the Packages API. Therefore package repository-access details are recorded as **owner-confirmed**, not API-verified. This limitation does not override or weaken the independent runtime access controls.
+The exception permits repository visibility to be temporarily public; it does **not** permit:
 
-The package itself must remain private throughout. Making the package public would permanently reject that package identity for the private target state.
+- making `hermes-private-vampi` public;
+- granting the public canonical source package access;
+- storing a PAT or Docker auth material in the repository;
+- using this public repository as the runtime credential boundary;
+- treating temporary public visibility as the accepted final state.
+
+## What this repository does
+
+- builds/publishes the reviewed private VAmPI package through GitHub Actions;
+- emits supply-chain evidence such as SBOM/provenance;
+- verifies anonymous private-package denial;
+- provides controlled consumer and rollback preflight workflows;
+- documents the publisher trust boundary and pilot.
+
+## What this repository does **not** do
+
+- deploy packages to Hermes;
+- own the canonical VAmPI source;
+- store the Hermes runtime pull credential;
+- grant broad package administration to the consumer;
+- expose the Hermes Docker socket to GitHub-hosted Actions;
+- prove that a package is safely usable in the runtime merely because publication succeeded.
+
+## Publication vs consumption sequence
+
+```mermaid
+sequenceDiagram
+    participant S as Canonical source
+    participant P as Publisher workflow
+    participant G as Private GHCR
+    participant H as Hermes consumer
+
+    S->>P: reviewed source/ref
+    P->>P: build + supply-chain checks
+    P->>G: publish private immutable digest
+    P-->>P: anonymous-deny / evidence
+    Note over P,H: publication boundary ends here
+    H->>G: authenticate with separate read-only credential
+    G-->>H: exact private digest
+    H->>H: lifecycle/acceptance/deployment controls
+```
 
 ## Remaining operational gate
 
-With the temporary public-repository implementation exception active, the controlled sequence is:
+The remaining path is consumer/deployment acceptance plus restoration of the final repository boundary:
 
-1. run and merge the repository-only validation/reconciliation work while the publisher is temporarily public;
-2. provision a distinct Hermes consumer credential with exactly `read:packages` outside GitHub and outside version control;
-3. authenticate through stdin using an isolated Docker configuration;
-4. prove exact-digest private pull;
-5. prove absence of push/delete authority without package mutation;
-6. run temporary private VAmPI lifecycle parity;
-7. review and merge the separate Compose migration;
-8. perform exact-SHA post-merge acceptance;
-9. demonstrate rollback to the accepted public digest;
-10. reconcile deployment tracking and drift detection;
-11. restore the publisher repository to `private` and revalidate final boundaries before closure.
+1. provision a distinct Hermes package-read credential outside Git and outside this publisher workflow;
+2. prove exact-digest private pull;
+3. prove absence of unnecessary push/delete authority without mutating package state;
+4. run temporary private VAmPI lifecycle parity;
+5. review/merge the separate runtime Compose migration;
+6. perform exact-SHA post-merge acceptance and rollback proof;
+7. reconcile deployment tracking/drift detection;
+8. restore this publisher repository to **private**;
+9. revalidate final package/repository access boundaries before closure.
 
-No consumer PAT is stored in this repository or in GitHub Actions for the runtime acceptance path.
+The canonical transition specification and tracking remain owned by `hermes-security-labs` (`docs/ghcr-private-readonly-transition.md`, issue `#53`).
 
-The canonical transition specification remains `pestoura/hermes-security-labs/docs/ghcr-private-readonly-transition.md` and tracking issue `#53`.
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [Publisher boundary](docs/publisher-boundary.md)
+- [Private VAmPI pilot](docs/vampi-private-pilot.md)
+- [Security](SECURITY.md)
+
+## Safety rule
+
+No PAT, Docker credential, private key, package admin credential or reusable runtime token may be committed to this repository. Runtime authentication material must remain outside the publisher boundary.
