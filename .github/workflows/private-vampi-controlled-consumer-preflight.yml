@@ -23,9 +23,9 @@ env:
 
 jobs:
   controlled-consumer-preflight:
-    name: Prove private digest read and core lifecycle in controlled CI
+    name: Prove private digest and Kali lifecycle parity in controlled CI
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout publisher policy source
@@ -85,7 +85,6 @@ jobs:
           print("PACKAGES_PERMISSION=read")
           print("PACKAGE_MUTATION_PATHS=absent")
           PY
-          echo "WRITE_AUTHORITY_POLICY_CONTROL=PASS" >> "$GITHUB_ENV"
 
       - name: Set up isolated Docker credential configuration
         shell: bash
@@ -114,7 +113,6 @@ jobs:
           docker pull "$IMAGE_REF"
           repo_digests="$(docker image inspect "$IMAGE_REF" --format '{{join .RepoDigests "\n"}}')"
           printf '%s\n' "$repo_digests" | grep -Fq "${IMAGE_DIGEST}"
-          echo "PRIVATE_DIGEST_PULL=PASS" >> "$GITHUB_ENV"
 
       - name: Create runtime-only private digest override
         shell: bash
@@ -132,7 +130,28 @@ jobs:
           echo "VAMPI_COMPOSE_OVERRIDE=${override_file}" >> "$GITHUB_ENV"
           echo "VAMPI_HOST_PORT=5500" >> "$GITHUB_ENV"
 
-      - name: Exercise accepted VAmPI core lifecycle against private digest
+      - name: Build and start accepted Kali MCP boundary
+        shell: bash
+        working-directory: security-labs
+        run: |
+          set -euo pipefail
+          mkdir -p kali-mcp/data/results kali-mcp/data/cache
+          docker compose -p hermes-kali-mcp -f kali-mcp/compose.yaml config --quiet
+          docker compose -p hermes-kali-mcp -f kali-mcp/compose.yaml up -d --build kali-mcp
+          for _ in $(seq 1 30); do
+            state="$(docker inspect hermes-kali-mcp --format '{{.State.Status}}' 2>/dev/null || true)"
+            health="$(docker inspect hermes-kali-mcp --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' 2>/dev/null || true)"
+            if [ "$state" = running ] && [ "$health" = healthy ]; then
+              echo 'KALI_MCP_READY=PASS'
+              exit 0
+            fi
+            [ "$state" != exited ] || break
+            sleep 5
+          done
+          docker logs --tail 100 hermes-kali-mcp || true
+          exit 1
+
+      - name: Exercise private VAmPI lifecycle and Kali connectivity
         shell: bash
         working-directory: security-labs
         run: |
@@ -141,7 +160,32 @@ jobs:
 
           "$lifecycle" start
           "$lifecycle" smoke
-          "$lifecycle" status
+          "$lifecycle" connect-kali
+
+          docker exec -i hermes-kali-mcp python3 - <<'PY'
+          import http.client
+          import socket
+
+          resolved = socket.gethostbyname("vampi")
+          if not resolved:
+              raise SystemExit("DNS resolution failed")
+
+          with socket.create_connection(("vampi", 5000), timeout=5):
+              pass
+
+          connection = http.client.HTTPConnection("vampi", 5000, timeout=5)
+          connection.request("GET", "/")
+          response = connection.getresponse()
+          response.read()
+          connection.close()
+          if not 200 <= response.status < 500:
+              raise SystemExit(f"unexpected HTTP status {response.status}")
+
+          print(f"KALI_DNS_TCP_HTTP=PASS resolved={resolved} http={response.status}")
+          PY
+
+          "$lifecycle" disconnect-kali
+          "$lifecycle" disconnect-kali
           "$lifecycle" stop
           "$lifecycle" start
           "$lifecycle" smoke
@@ -156,6 +200,10 @@ jobs:
           fi
           if docker network inspect vampi-lab >/dev/null 2>&1; then
             echo 'FAIL: residual VAmPI network remains' >&2
+            exit 1
+          fi
+          if docker network inspect hermes-kali-mcp_hermes-kali-lab --format '{{range $k, $v := .Containers}}{{$v.Name}} {{end}}' | grep -qw vampi-vampi-1; then
+            echo 'FAIL: VAmPI remained attached to Kali base network' >&2
             exit 1
           fi
 
@@ -174,7 +222,9 @@ jobs:
             echo '- PR-triggered package-capable execution: `forbidden`'
             echo '- Exact private digest pull: `PASS`'
             echo '- Core VAmPI lifecycle: `PASS`'
-            echo '- Residual containers/networks: `0`'
+            echo '- Temporary Kali DNS/TCP/HTTP connectivity: `PASS`'
+            echo '- Kali disconnect idempotence: `PASS`'
+            echo '- Residual VAmPI containers/networks: `0`'
             echo '- Package mutation: `none`'
             echo '- Long-lived credential: `none`'
             echo '- GHCR bearer grant introspection: `UNSUPPORTED_OPAQUE_TOKEN`'
@@ -191,6 +241,16 @@ jobs:
           if [ -n "${VAMPI_COMPOSE_OVERRIDE:-}" ] && [ -f "${VAMPI_COMPOSE_OVERRIDE}" ]; then
             platform/environments/web-api/vampi/scripts/lifecycle.sh destroy >/dev/null 2>&1 || true
           fi
+          docker compose -p hermes-kali-mcp -f kali-mcp/compose.yaml down --remove-orphans >/dev/null 2>&1 || true
           docker logout ghcr.io >/dev/null 2>&1 || true
           rm -rf "${GITHUB_WORKSPACE}/security-labs/.runtime/issue53-ci-preflight"
           rm -rf "${DOCKER_CONFIG:-}"
+
+          if docker ps -a --filter label=com.docker.compose.project=vampi --format '{{.ID}}' | grep -q .; then
+            echo 'FAIL: VAmPI residue after cleanup' >&2
+            exit 1
+          fi
+          if docker ps -a --filter label=com.docker.compose.project=hermes-kali-mcp --format '{{.ID}}' | grep -q .; then
+            echo 'FAIL: Kali MCP residue after cleanup' >&2
+            exit 1
+          fi
