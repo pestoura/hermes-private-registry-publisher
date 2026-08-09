@@ -1,0 +1,211 @@
+name: Private VAmPI controlled rollback preflight
+
+on:
+  push:
+    branches:
+      - main
+      - 'lane/**'
+  workflow_dispatch:
+
+# Owner-controlled refs only. No pull_request / pull_request_target trigger is
+# permitted because this workflow receives private-package read authority.
+permissions:
+  contents: read
+  packages: read
+
+env:
+  SOURCE_SHA: ff5e1953f7be5d96024df8c79b332282d2f54ea3
+  PRIVATE_IMAGE: ghcr.io/pestoura/hermes-private-vampi@sha256:b1b66324a2d35cfe55e3edcd81f9f3c012907c71367df37f83d9ef63b500b3d3
+  PUBLIC_ROLLBACK_IMAGE: ghcr.io/pestoura/hermes-vampi@sha256:e7b2760d586ed2b4b15a689823a07816e32308bca293f9e8c08830c7b36c7229
+
+jobs:
+  rollback-preflight:
+    name: Prove controlled private-to-public rollback lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout exact canonical security-labs source
+        uses: actions/checkout@v4
+        with:
+          repository: pestoura/hermes-security-labs
+          ref: ${{ env.SOURCE_SHA }}
+          path: security-labs
+          persist-credentials: false
+
+      - name: Set up isolated Docker credential configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth_dir="${RUNNER_TEMP}/hermes-rollback-docker"
+          mkdir -p "$auth_dir"
+          chmod 700 "$auth_dir"
+          printf '{"auths":{}}\n' > "${auth_dir}/config.json"
+          chmod 600 "${auth_dir}/config.json"
+          echo "DOCKER_CONFIG=${auth_dir}" >> "$GITHUB_ENV"
+
+      - name: Authenticate with ephemeral read-only workflow token
+        shell: bash
+        env:
+          GHCR_REPOSITORY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_REPOSITORY_TOKEN" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin >/dev/null
+          unset GHCR_REPOSITORY_TOKEN
+
+      - name: Pull immutable private and public rollback digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$PRIVATE_IMAGE"
+          docker pull "$PUBLIC_ROLLBACK_IMAGE"
+          docker image inspect "$PRIVATE_IMAGE" >/dev/null
+          docker image inspect "$PUBLIC_ROLLBACK_IMAGE" >/dev/null
+
+      - name: Build and start accepted Kali MCP boundary
+        shell: bash
+        working-directory: security-labs
+        run: |
+          set -euo pipefail
+          mkdir -p kali-mcp/data/results kali-mcp/data/cache
+          docker compose -p hermes-kali-mcp -f kali-mcp/compose.yaml config --quiet
+          docker compose -p hermes-kali-mcp -f kali-mcp/compose.yaml up -d --build kali-mcp
+          for _ in $(seq 1 30); do
+            state="$(docker inspect hermes-kali-mcp --format '{{.State.Status}}' 2>/dev/null || true)"
+            health="$(docker inspect hermes-kali-mcp --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' 2>/dev/null || true)"
+            if [ "$state" = running ] && [ "$health" = healthy ]; then
+              echo 'KALI_MCP_READY=PASS'
+              exit 0
+            fi
+            [ "$state" != exited ] || break
+            sleep 5
+          done
+          docker logs --tail 100 hermes-kali-mcp || true
+          exit 1
+
+      - name: Exercise private baseline then public rollback
+        shell: bash
+        working-directory: security-labs
+        run: |
+          set -euo pipefail
+          lifecycle="platform/environments/web-api/vampi/scripts/lifecycle.sh"
+          runtime_dir="${GITHUB_WORKSPACE}/security-labs/.runtime/issue53-ci-rollback"
+          override_file="${runtime_dir}/compose.rollback.yaml"
+          mkdir -p "$runtime_dir"
+          chmod 700 "$runtime_dir"
+          export VAMPI_COMPOSE_OVERRIDE="$override_file"
+          export VAMPI_HOST_PORT=5500
+
+          write_override() {
+            local image="$1"
+            cat > "$override_file" <<EOF
+          services:
+            vampi:
+              image: ${image}
+          EOF
+            chmod 600 "$override_file"
+          }
+
+          prove_kali_path() {
+            "$lifecycle" connect-kali
+            docker exec -i hermes-kali-mcp python3 - <<'PY'
+          import http.client
+          import socket
+
+          resolved = socket.gethostbyname("vampi")
+          with socket.create_connection(("vampi", 5000), timeout=5):
+              pass
+          connection = http.client.HTTPConnection("vampi", 5000, timeout=5)
+          connection.request("GET", "/")
+          response = connection.getresponse()
+          response.read()
+          connection.close()
+          if not 200 <= response.status < 500:
+              raise SystemExit(f"unexpected HTTP status {response.status}")
+          print(f"KALI_PATH=PASS resolved={resolved} http={response.status}")
+          PY
+            "$lifecycle" disconnect-kali
+            "$lifecycle" disconnect-kali
+          }
+
+          prove_runtime() {
+            local expected_image="$1"
+            "$lifecycle" start
+            "$lifecycle" smoke
+            actual="$(docker inspect vampi-vampi-1 --format '{{.Config.Image}}')"
+            [ "$actual" = "$expected_image" ] || {
+              echo "FAIL: expected image $expected_image, running $actual" >&2
+              return 1
+            }
+            prove_kali_path
+            "$lifecycle" stop
+            "$lifecycle" start
+            "$lifecycle" smoke
+            "$lifecycle" reset
+            "$lifecycle" smoke
+            "$lifecycle" destroy
+            "$lifecycle" destroy
+          }
+
+          write_override "$PRIVATE_IMAGE"
+          prove_runtime "$PRIVATE_IMAGE"
+          echo 'PRIVATE_BASELINE=PASS'
+
+          write_override "$PUBLIC_ROLLBACK_IMAGE"
+          prove_runtime "$PUBLIC_ROLLBACK_IMAGE"
+          echo 'PUBLIC_ROLLBACK=PASS'
+
+          if docker ps -a --filter label=com.docker.compose.project=vampi --format '{{.ID}}' | grep -q .; then
+            echo 'FAIL: residual VAmPI container remains' >&2
+            exit 1
+          fi
+          if docker network inspect vampi-lab >/dev/null 2>&1; then
+            echo 'FAIL: residual VAmPI network remains' >&2
+            exit 1
+          fi
+
+      - name: Record controlled rollback evidence boundary
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo '### Private VAmPI controlled rollback preflight'
+            echo
+            echo "- Canonical source SHA: \`$SOURCE_SHA\`"
+            echo "- Private baseline: \`$PRIVATE_IMAGE\`"
+            echo "- Public rollback: \`$PUBLIC_ROLLBACK_IMAGE\`"
+            echo '- Private exact-digest lifecycle: `PASS`'
+            echo '- Public exact-digest rollback lifecycle: `PASS`'
+            echo '- Kali DNS/TCP/HTTP on both states: `PASS`'
+            echo '- Stop/start/reset/double-destroy on both states: `PASS`'
+            echo '- Registry/package mutation: `none`'
+            echo '- Long-lived credential: `none`'
+            echo '- Evidence class: `CONTROLLED_CI_ROLLBACK_PROOF_ONLY`'
+            echo '- Hermes final rollback status: `NOT_CLAIMED`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup credentials and runtime state
+        if: always()
+        shell: bash
+        working-directory: security-labs
+        run: |
+          set +e
+          runtime_dir="${GITHUB_WORKSPACE}/security-labs/.runtime/issue53-ci-rollback"
+          override_file="${runtime_dir}/compose.rollback.yaml"
+          if [ -f "$override_file" ]; then
+            VAMPI_COMPOSE_OVERRIDE="$override_file" VAMPI_HOST_PORT=5500 \
+              platform/environments/web-api/vampi/scripts/lifecycle.sh destroy >/dev/null 2>&1 || true
+          fi
+          docker compose -p hermes-kali-mcp -f kali-mcp/compose.yaml down --remove-orphans >/dev/null 2>&1 || true
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          rm -rf "$runtime_dir"
+          rm -rf "${DOCKER_CONFIG:-}"
+
+          if docker ps -a --filter label=com.docker.compose.project=vampi --format '{{.ID}}' | grep -q .; then
+            echo 'FAIL: VAmPI residue after rollback cleanup' >&2
+            exit 1
+          fi
+          if docker ps -a --filter label=com.docker.compose.project=hermes-kali-mcp --format '{{.ID}}' | grep -q .; then
+            echo 'FAIL: Kali MCP residue after rollback cleanup' >&2
+            exit 1
+          fi
