@@ -1,0 +1,142 @@
+name: Private VAmPI controlled consumer preflight
+
+on:
+  push:
+    branches:
+      - main
+      - 'lane/**'
+  workflow_dispatch:
+
+# Deliberately no pull_request or pull_request_target trigger.
+# This workflow receives package read authority and must only execute from
+# owner-controlled refs in this repository while the temporary public
+# implementation exception is active.
+permissions:
+  contents: read
+  packages: read
+
+env:
+  SOURCE_REPOSITORY: pestoura/hermes-security-labs
+  SOURCE_SHA: ff5e1953f7be5d96024df8c79b332282d2f54ea3
+  IMAGE_REF: ghcr.io/pestoura/hermes-private-vampi@sha256:b1b66324a2d35cfe55e3edcd81f9f3c012907c71367df37f83d9ef63b500b3d3
+  IMAGE_DIGEST: sha256:b1b66324a2d35cfe55e3edcd81f9f3c012907c71367df37f83d9ef63b500b3d3
+
+jobs:
+  controlled-consumer-preflight:
+    name: Prove private digest read and core lifecycle in controlled CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout exact canonical security-labs source
+        uses: actions/checkout@v4
+        with:
+          repository: pestoura/hermes-security-labs
+          ref: ${{ env.SOURCE_SHA }}
+          path: security-labs
+          persist-credentials: false
+
+      - name: Set up isolated Docker credential configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth_dir="${RUNNER_TEMP}/hermes-private-consumer-docker"
+          mkdir -p "$auth_dir"
+          chmod 700 "$auth_dir"
+          printf '{"auths":{}}\n' > "${auth_dir}/config.json"
+          chmod 600 "${auth_dir}/config.json"
+          echo "DOCKER_CONFIG=${auth_dir}" >> "$GITHUB_ENV"
+
+      - name: Authenticate to GHCR with ephemeral publisher repository token
+        shell: bash
+        env:
+          GHCR_REPOSITORY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_REPOSITORY_TOKEN" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin >/dev/null
+          unset GHCR_REPOSITORY_TOKEN
+
+      - name: Pull exact private VAmPI digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE_REF"
+          repo_digests="$(docker image inspect "$IMAGE_REF" --format '{{join .RepoDigests "\n"}}')"
+          printf '%s\n' "$repo_digests" | grep -Fq "${IMAGE_DIGEST}"
+          echo "PRIVATE_DIGEST_PULL=PASS" >> "$GITHUB_ENV"
+
+      - name: Create runtime-only private digest override
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_dir="${GITHUB_WORKSPACE}/security-labs/.runtime/issue53-ci-preflight"
+          mkdir -p "$runtime_dir"
+          override_file="${runtime_dir}/compose.private.yaml"
+          cat > "$override_file" <<EOF
+          services:
+            vampi:
+              image: ${IMAGE_REF}
+          EOF
+          chmod 600 "$override_file"
+          echo "VAMPI_COMPOSE_OVERRIDE=${override_file}" >> "$GITHUB_ENV"
+          echo "VAMPI_HOST_PORT=5500" >> "$GITHUB_ENV"
+
+      - name: Exercise accepted VAmPI core lifecycle against private digest
+        shell: bash
+        working-directory: security-labs
+        run: |
+          set -euo pipefail
+          lifecycle="platform/environments/web-api/vampi/scripts/lifecycle.sh"
+
+          "$lifecycle" start
+          "$lifecycle" smoke
+          "$lifecycle" status
+          "$lifecycle" stop
+          "$lifecycle" start
+          "$lifecycle" smoke
+          "$lifecycle" reset
+          "$lifecycle" smoke
+          "$lifecycle" destroy
+          "$lifecycle" destroy
+
+          if docker ps -a --filter label=com.docker.compose.project=vampi --format '{{.ID}}' | grep -q .; then
+            echo 'FAIL: residual VAmPI container remains' >&2
+            exit 1
+          fi
+          if docker network inspect vampi-lab >/dev/null 2>&1; then
+            echo 'FAIL: residual VAmPI network remains' >&2
+            exit 1
+          fi
+
+      - name: Record controlled CI evidence boundary
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo '### Private VAmPI controlled consumer preflight'
+            echo
+            echo "- Canonical source SHA: \`$SOURCE_SHA\`"
+            echo "- Private image: \`$IMAGE_REF\`"
+            echo '- Credential: ephemeral repository `GITHUB_TOKEN`'
+            echo '- Workflow authority: `contents: read`, `packages: read`'
+            echo '- Exact private digest pull: `PASS`'
+            echo '- Core VAmPI lifecycle: `PASS`'
+            echo '- Residual containers/networks: `0`'
+            echo '- Package mutation: `none`'
+            echo '- Long-lived credential: `none`'
+            echo '- Evidence class: `CONTROLLED_CI_PREFLIGHT_ONLY`'
+            echo '- Hermes Gate F/H final status: `NOT_CLAIMED`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup credentials and runtime state
+        if: always()
+        shell: bash
+        working-directory: security-labs
+        run: |
+          set +e
+          if [ -n "${VAMPI_COMPOSE_OVERRIDE:-}" ] && [ -f "${VAMPI_COMPOSE_OVERRIDE}" ]; then
+            platform/environments/web-api/vampi/scripts/lifecycle.sh destroy >/dev/null 2>&1 || true
+          fi
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          rm -rf "${GITHUB_WORKSPACE}/security-labs/.runtime/issue53-ci-preflight"
+          rm -rf "${DOCKER_CONFIG:-}"
